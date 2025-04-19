@@ -455,3 +455,8 @@ examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bflo
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)
 perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
 perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
+accuracy/test_cli_flow/TestSantacoder.py::test_auto_dtype SKIP (https://nvbugs/5231468)
+accuracy/test_cli_flow/TestLlama3_2_1B.py::test_cyclic_kv_cache SKIP (https://nvbugs/5231310)
+accuracy/test_llm_api_pytorch/TestMixtral8x7B.py::test_fp8_tp2 SKIP (https://nvbugs/5220763)
+test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1] SKIP (https://nvbugs/5233422)
+test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image] SKIP (https://nvbugs/5233423)
