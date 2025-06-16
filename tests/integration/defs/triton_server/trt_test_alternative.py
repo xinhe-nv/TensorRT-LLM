@@ -203,11 +203,17 @@ except ImportError:
                 if retcode and start_new_session:
                     cleanup_process_tree(p, True)
                 return retcode
+            except subprocess.TimeoutExpired:
+                print(
+                    f"Process timed out after {timeout} seconds, killing process tree..."
+                )
+                cleanup_process_tree(p, start_new_session)
+                raise subprocess.TimeoutExpired(p.args, timeout)
             except:
                 cleanup_process_tree(p, start_new_session)
                 raise
 
-    def check_call(*popenargs, **kwargs):
+    def check_call(*popenargs, timeout=None, **kwargs):
         # Create a copy of kwargs without env to avoid displaying sensitive information
         simplified_kwargs = kwargs.copy()
         if 'env' in simplified_kwargs:
@@ -215,13 +221,24 @@ except ImportError:
         print(
             f"[info] Start subprocess with check_call({popenargs}, {simplified_kwargs})"
         )
-        retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-        if retcode:
+        try:
+            retcode = call(*popenargs,
+                           timeout=timeout,
+                           suppress_output_info=True,
+                           **kwargs)
+            if retcode:
+                cmd = kwargs.get("args")
+                if cmd is None:
+                    cmd = popenargs[0]
+                raise subprocess.CalledProcessError(retcode, cmd)
+            return 0
+        except subprocess.TimeoutExpired as e:
+            print(f"check_call timed out after {timeout} seconds")
             cmd = kwargs.get("args")
             if cmd is None:
                 cmd = popenargs[0]
-            raise subprocess.CalledProcessError(retcode, cmd)
-        return 0
+            raise subprocess.CalledProcessError(
+                -1, cmd, output=f"Process timed out after {timeout} seconds")
 
     def check_output(*popenargs,
                      timeout=None,

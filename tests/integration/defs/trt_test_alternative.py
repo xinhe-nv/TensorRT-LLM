@@ -220,22 +220,39 @@ def call(*popenargs,
             except subprocess.TimeoutExpired:
                 elapsed_time += spin_time
                 if actual_timeout is not None and elapsed_time >= actual_timeout:
-                    raise
+                    print(
+                        f"Process timed out after {elapsed_time} seconds, killing process tree..."
+                    )
+                    cleanup_process_tree(p,
+                                         start_new_session,
+                                         verbose_message=True)
+                    raise subprocess.TimeoutExpired(p.args, actual_timeout)
             for p_poll in poll_procs:
                 if p_poll.poll() is None:
                     continue
                 raise RuntimeError("A sub-process has exited.")
 
 
-def check_call(*popenargs, **kwargs):
+def check_call(*popenargs, timeout=None, **kwargs):
     print(f"Start subprocess with check_call({popenargs}, {kwargs})")
-    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-    if retcode:
+    try:
+        retcode = call(*popenargs,
+                       timeout=timeout,
+                       suppress_output_info=True,
+                       **kwargs)
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            raise subprocess.CalledProcessError(retcode, cmd)
+        return 0
+    except subprocess.TimeoutExpired as e:
+        print(f"check_call timed out after {timeout} seconds")
         cmd = kwargs.get("args")
         if cmd is None:
             cmd = popenargs[0]
-        raise subprocess.CalledProcessError(retcode, cmd)
-    return 0
+        raise subprocess.CalledProcessError(
+            -1, cmd, output=f"Process timed out after {timeout} seconds")
 
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
