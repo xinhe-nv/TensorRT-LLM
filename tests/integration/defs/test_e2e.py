@@ -1682,10 +1682,12 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @skip_pre_hopper
-@skip_post_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3'])
-def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
-        llm_root, llm_venv, model_path):
+@pytest.mark.parametrize("model_path", [
+    pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
+                                                      model_path):
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
@@ -2198,10 +2200,10 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
                  marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
                  marks=skip_pre_hopper),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
 ])
-def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
+def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
+                                                   model_path):
     print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     run_cmd = [
