@@ -183,13 +183,25 @@ def popen(*popenargs,
     if not suppress_output_info:
         print(f"Start subprocess with popen({popenargs}, {kwargs})")
 
+    # Check if this is an mpirun command that needs special handling
+    is_mpirun = len(popenargs) > 0 and (
+        (isinstance(popenargs[0], list) and len(popenargs[0]) > 0
+         and 'mpirun' in popenargs[0][0]) or
+        (isinstance(popenargs[0], str) and 'mpirun' in popenargs[0]))
+
     with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
             yield p
             if start_new_session:
-                cleanup_process_tree(p, True, True)
+                if is_mpirun:
+                    _aggressive_mpirun_cleanup(p, True)
+                else:
+                    cleanup_process_tree(p, True, True)
         except Exception as e:
-            cleanup_process_tree(p, start_new_session)
+            if is_mpirun:
+                _aggressive_mpirun_cleanup(p, start_new_session)
+            else:
+                cleanup_process_tree(p, start_new_session)
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
@@ -209,6 +221,13 @@ def call(*popenargs,
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
     actual_timeout = get_pytest_timeout(timeout)
+
+    # Check if this is an mpirun command that needs special handling
+    is_mpirun = len(popenargs) > 0 and (
+        (isinstance(popenargs[0], list) and len(popenargs[0]) > 0
+         and 'mpirun' in popenargs[0][0]) or
+        (isinstance(popenargs[0], str) and 'mpirun' in popenargs[0]))
+
     with popen(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
@@ -216,6 +235,7 @@ def call(*popenargs,
         elapsed_time = 0
         while True:
             try:
+                print(f"Process {p.pid} is running...")
                 return p.wait(timeout=spin_time)
             except subprocess.TimeoutExpired:
                 elapsed_time += spin_time
@@ -223,14 +243,121 @@ def call(*popenargs,
                     print(
                         f"Process timed out after {elapsed_time} seconds, killing process tree..."
                     )
-                    cleanup_process_tree(p,
-                                         start_new_session,
-                                         verbose_message=True)
+                    # For mpirun, use more aggressive cleanup
+                    if is_mpirun:
+                        _aggressive_mpirun_cleanup(p, start_new_session)
+                    else:
+                        cleanup_process_tree(p,
+                                             start_new_session,
+                                             verbose_message=True)
                     raise subprocess.TimeoutExpired(p.args, actual_timeout)
             for p_poll in poll_procs:
                 if p_poll.poll() is None:
                     continue
                 raise RuntimeError("A sub-process has exited.")
+
+
+def _aggressive_mpirun_cleanup(p: subprocess.Popen, has_session=False):
+    """
+    More aggressive cleanup for mpirun processes that can leave behind
+    complex process trees and background threads.
+    """
+    import time
+
+    target_pids = set()
+
+    # First, try to find all mpirun and related processes by name
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+            try:
+                proc_info = proc.info
+                cmdline = proc_info.get('cmdline', [])
+                name = proc_info.get('name', '')
+
+                # Look for mpirun, orterun, orted, and any python processes launched by mpi
+                if (name in ['mpirun', 'orterun', 'orted', 'mpiexec']
+                        or any('mpi' in cmd for cmd in cmdline if cmd)
+                        or any('trtllm' in cmd for cmd in cmdline if cmd)
+                        or any('tritonserver' in cmd
+                               for cmd in cmdline if cmd)):
+                    target_pids.add(proc_info['pid'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                pass
+    except Exception as e:
+        print(f"Warning: Failed to scan processes by name: {e}")
+
+    # Use the original session/parent-based tracking as backup
+    if has_session:
+        try:
+            target_pids.update(list_process_sid(p.pid))
+        except Exception as e:
+            print(f"Warning: Failed to get session processes: {e}")
+
+    # Add children recursively
+    try:
+        target_pids.update(
+            sub.pid for sub in psutil.Process(p.pid).children(recursive=True))
+    except psutil.Error as e:
+        print(f"Warning: Failed to get child processes: {e}")
+
+    # Add the main process
+    target_pids.add(p.pid)
+
+    print(
+        f"Found {len(target_pids)} processes to terminate: {sorted(target_pids)}"
+    )
+
+    # First try SIGTERM for graceful shutdown
+    for pid in sorted(target_pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Give processes a chance to terminate gracefully
+    time.sleep(3)
+
+    # Check which processes are still alive and use SIGKILL
+    persist_pids = []
+    for pid in sorted(target_pids):
+        try:
+            sp = psutil.Process(pid)
+            if sp.is_running():
+                persist_pids.append(pid)
+        except psutil.Error:
+            pass
+
+    if persist_pids:
+        print(
+            f"Force killing {len(persist_pids)} persistent processes: {persist_pids}"
+        )
+        for pid in persist_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # Final cleanup of the main process
+    try:
+        p.kill()
+    except:
+        pass
+
+    # Additional cleanup: kill any remaining mpirun processes system-wide
+    # This is aggressive but necessary for mpirun scenarios
+    try:
+        subprocess.run(['pkill', '-9', '-f', 'mpirun'],
+                       capture_output=True,
+                       timeout=5)
+        subprocess.run(['pkill', '-9', '-f', 'orted'],
+                       capture_output=True,
+                       timeout=5)
+        subprocess.run(['pkill', '-9', '-f', 'orterun'],
+                       capture_output=True,
+                       timeout=5)
+    except Exception as e:
+        print(f"Warning: Failed to run system-wide cleanup: {e}")
 
 
 def check_call(*popenargs, timeout=None, **kwargs):
@@ -258,6 +385,13 @@ def check_call(*popenargs, timeout=None, **kwargs):
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
     print(f"Start subprocess with check_output({popenargs}, {kwargs})")
     actual_timeout = get_pytest_timeout(timeout)
+
+    # Check if this is an mpirun command that needs special handling
+    is_mpirun = len(popenargs) > 0 and (
+        (isinstance(popenargs[0], list) and len(popenargs[0]) > 0
+         and 'mpirun' in popenargs[0][0]) or
+        (isinstance(popenargs[0], str) and 'mpirun' in popenargs[0]))
+
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
@@ -265,18 +399,27 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         try:
             stdout, stderr = process.communicate(None, timeout=actual_timeout)
         except subprocess.TimeoutExpired as exc:
-            cleanup_process_tree(process, start_new_session)
+            if is_mpirun:
+                _aggressive_mpirun_cleanup(process, start_new_session)
+            else:
+                cleanup_process_tree(process, start_new_session)
             if is_windows():
                 exc.stdout, exc.stderr = process.communicate()
             else:
                 process.wait()
             raise
         except:
-            cleanup_process_tree(process, start_new_session)
+            if is_mpirun:
+                _aggressive_mpirun_cleanup(process, start_new_session)
+            else:
+                cleanup_process_tree(process, start_new_session)
             raise
         retcode = process.poll()
         if start_new_session:
-            cleanup_process_tree(process, True, True)
+            if is_mpirun:
+                _aggressive_mpirun_cleanup(process, True)
+            else:
+                cleanup_process_tree(process, True, True)
         if retcode:
             raise subprocess.CalledProcessError(retcode,
                                                 process.args,
@@ -361,3 +504,29 @@ def get_pytest_timeout(timeout=None):
         print(f"Error getting pytest timeout: {e}")
 
     return timeout
+
+
+def force_cleanup_mpi_processes():
+    """
+    Utility function to force cleanup any remaining MPI processes.
+    This can be called at the beginning of tests to ensure a clean state.
+    """
+    try:
+        # Kill any remaining mpirun, orted, and related processes
+        for process_name in ['mpirun', 'orted', 'orterun', 'mpiexec']:
+            subprocess.run(['pkill', '-9', '-f', process_name],
+                           capture_output=True,
+                           timeout=5)
+
+        # Also kill any trtllm processes that might be left hanging
+        subprocess.run(['pkill', '-9', '-f', 'trtllm'],
+                       capture_output=True,
+                       timeout=5)
+        subprocess.run(['pkill', '-9', '-f', 'tritonserver'],
+                       capture_output=True,
+                       timeout=5)
+
+        # Give a moment for cleanup
+        time.sleep(1)
+    except Exception as e:
+        print(f"Warning: Failed to perform force cleanup: {e}")
