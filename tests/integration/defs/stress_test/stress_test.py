@@ -29,6 +29,7 @@ Usage example for accuracy testing:
     pytest tests/integration/defs/stress_test/stress_test.py::test_run_stress_test[stress-test-with-accuracy]
 """
 import contextlib
+import itertools
 import json
 import os
 import re
@@ -38,15 +39,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 from glob import glob
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytest
 import requests
 import yaml
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
-from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
-                                       print_warning)
+from defs.trt_test_alternative import (Popen, cleanup_process_tree, popen,
+                                       print_info, print_warning)
 
 # Install genai-perf in requirements-dev.txt will affect triton and pytorch version mismatch
 # def genai_perf_install():
@@ -340,6 +341,185 @@ def check_server_health(server_url: str,
         return False, f"Unexpected error during health check: {str(e)}"
 
 
+@contextlib.contextmanager
+def launch_disaggregated_serving(disaggregated_server_config: Dict[str, Any],
+                                 ctx_server_config: Dict[str, Any],
+                                 gen_server_config: Dict[str, Any],
+                                 model_path: str,
+                                 ctx_model_path: str = None,
+                                 gen_model_path: str = None,
+                                 server_waiting_timeout: int = 3600):
+    """
+    Context manager to launch disaggregated serving with context and generation servers.
+
+    Args:
+        disaggregated_server_config: Main disaggregated server configuration
+        ctx_server_config: Context server configuration
+        gen_server_config: Generation server configuration
+        model_path: Default model path (used if ctx/gen specific paths not provided)
+        ctx_model_path: Optional specific path for context servers
+        gen_model_path: Optional specific path for generation servers
+        server_waiting_timeout: Timeout for server initialization in seconds
+    """
+    temp_dir = tempfile.TemporaryDirectory()
+
+    # Write configuration files
+    disaggregated_config_path = os.path.join(
+        temp_dir.name, "disaggregated_serving_config.yaml")
+    ctx_config_path = os.path.join(temp_dir.name, "ctx_server_config.yaml")
+    gen_config_path = os.path.join(temp_dir.name, "gen_server_config.yaml")
+
+    with open(disaggregated_config_path, "w") as f:
+        yaml.dump(disaggregated_server_config, f)
+    with open(ctx_config_path, "w") as f:
+        yaml.dump(ctx_server_config, f)
+    with open(gen_config_path, "w") as f:
+        yaml.dump(gen_server_config, f)
+
+    ctx_model = ctx_model_path or model_path
+    gen_model = gen_model_path or model_path
+
+    trtllm_serve_path = "trtllm-serve"
+
+    # Get parallelism settings
+    gen_tp = gen_server_config.get("tensor_parallel_size", 1)
+    gen_pp = gen_server_config.get("pipeline_parallel_size", 1)
+    ctx_tp = ctx_server_config.get("tensor_parallel_size", 1)
+    ctx_pp = ctx_server_config.get("pipeline_parallel_size", 1)
+
+    ctx_total_gpus = ctx_tp * ctx_pp
+    gen_total_gpus = gen_tp * gen_pp
+
+    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
+    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
+
+    ctx_ports = [int(url.split(":")[1]) for url in ctx_urls]
+    gen_ports = [int(url.split(":")[1]) for url in gen_urls]
+
+    # Prepare context server commands
+    ctx_servers = []
+    current_gpu_offset = 0
+
+    for i, port in enumerate(ctx_ports):
+        env_ctx = os.environ.copy()
+        env_ctx["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        gpu_range = range(current_gpu_offset,
+                          current_gpu_offset + ctx_total_gpus)
+        env_ctx["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        current_gpu_offset += ctx_total_gpus
+
+        ctx_server_args = [
+            trtllm_serve_path, ctx_model, "--host", "localhost", "--backend",
+            "pytorch", "--port",
+            str(port), "--extra_llm_api_options", ctx_config_path,
+            f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}"
+        ]
+        if "max_num_tokens" in ctx_server_config:
+            ctx_server_args.append(
+                f"--max_num_tokens={ctx_server_config['max_num_tokens']}")
+        if "max_batch_size" in ctx_server_config:
+            ctx_server_args.append(
+                f"--max_batch_size={ctx_server_config['max_batch_size']}")
+
+        ctx_servers.append((env_ctx, ctx_server_args))
+
+    # Prepare generation server commands
+    gen_servers = []
+
+    for i, port in enumerate(gen_ports):
+        env_gen = os.environ.copy()
+        env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        gpu_range = range(current_gpu_offset,
+                          current_gpu_offset + gen_total_gpus)
+        env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        current_gpu_offset += gen_total_gpus
+
+        gen_server_args = [
+            trtllm_serve_path, gen_model, "--host", "localhost", "--backend",
+            "pytorch", "--port",
+            str(port), "--extra_llm_api_options", gen_config_path,
+            f"--tp_size={gen_tp}", f"--pp_size={gen_pp}"
+        ]
+        if "max_num_tokens" in gen_server_config:
+            gen_server_args.append(
+                f"--max_num_tokens={gen_server_config['max_num_tokens']}")
+        if "max_batch_size" in gen_server_config:
+            gen_server_args.append(
+                f"--max_batch_size={gen_server_config['max_batch_size']}")
+
+        gen_servers.append((env_gen, gen_server_args))
+
+    @contextlib.contextmanager
+    def multi_popen(server_configs):
+        """Helper to start multiple server processes"""
+        processes = []
+        try:
+            for env, args in server_configs:
+                proc = popen(args, env=env)
+                processes.append(proc)
+
+            with contextlib.ExitStack() as stack:
+                opened_processes = [
+                    stack.enter_context(proc) for proc in processes
+                ]
+                yield opened_processes
+        except Exception as e:
+            print_warning(
+                f"Failed to start disaggregated server processes: {e}")
+            raise
+
+    # Prepare main disaggregated server command
+    server_cmd = [
+        trtllm_serve_path, "disaggregated", "-c", disaggregated_config_path,
+        "--server_start_timeout",
+        str(server_waiting_timeout), "-r", "360000"
+    ]
+
+    with (temp_dir, multi_popen(ctx_servers + gen_servers) as
+          worker_processes, popen(server_cmd) as server_process):
+
+        print_info("Waiting for disaggregated servers to initialize...")
+        start_time = time.time()
+        server_ready = False
+
+        while time.time() - start_time < server_waiting_timeout:
+            time.sleep(5)
+
+            # Check if any process has died
+            for process in itertools.chain(worker_processes, [server_process]):
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"Process {process.pid} exited with code {process.returncode}"
+                    )
+
+            # Check health endpoint
+            try:
+                print_info("Checking health endpoint...")
+                response = requests.get(
+                    f"http://localhost:{disaggregated_server_config['port']}/health",
+                    timeout=10)
+                if response.status_code == 200:
+                    print_info("Disaggregated server is ready!")
+                    server_ready = True
+                    break
+            except requests.exceptions.ConnectionError:
+                continue
+            except Exception as e:
+                print_warning(f"Health check error: {e}")
+                continue
+
+        if not server_ready:
+            raise RuntimeError(
+                f"Disaggregated server failed to start within {server_waiting_timeout} seconds"
+            )
+
+        yield  # Server is ready for use
+
+        print_info("Shutting down disaggregated servers...")
+
+    print_info("Disaggregated servers stopped")
+
+
 @pytest.mark.parametrize(
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
@@ -402,6 +582,280 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     # Call the existing stress_test function with the new config and test mode
     stress_test(new_config, test_mode, server_config, stress_time,
                 stress_timeout)
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        # Configuration for DeepSeek-R1-0528-FP4 model with 8 GPUs (4+4)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=4,
+                    memory_requirement=120),
+        # Configuration for DeepSeek-R1-0528-FP4 model with 4 GPUs (2+2) - for GB200
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=2,
+                    memory_requirement=120),
+    ],
+    ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
+@pytest.mark.parametrize("test_mode", ["stress-test-with-accuracy"],
+                         ids=lambda x: x)
+@pytest.mark.parametrize("capacity_scheduler_policy",
+                         ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
+                         ids=lambda x: x)
+@pytest.mark.parametrize("stress_time_timeout", [(3600, 5400)],
+                         ids=lambda x: f"stress_time_{x[0]}s_timeout_{x[1]}s")
+def test_disaggregated_stress_test(model_config, test_mode,
+                                   capacity_scheduler_policy,
+                                   stress_time_timeout):
+    """Run disaggregated serving stress test with configurable models.
+
+    This test uses disaggregated serving with separate context and generation servers
+    to stress test large language models. The disaggregated architecture allows for
+    separate scaling of context and generation phases.
+
+    Test modes:
+    - "stress-test": Runs performance test followed by stress test
+    - "stress-stage-alone": Runs only stress test with customized parameters
+    - "stress-test-with-accuracy": Runs performance test, stress test, and accuracy tests (GSM8K)
+
+    Scheduler policies:
+    - "GUARANTEED_NO_EVICT": Guarantees no request eviction, more conservative
+    - "MAX_UTILIZATION": Maximizes GPU utilization, more aggressive
+
+    Args:
+        model_config: Model configuration containing model_dir, tp_size, and memory_requirement
+        test_mode: Test mode ("stress-test", "stress-stage-alone", or "stress-test-with-accuracy")
+        capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT" or "MAX_UTILIZATION")
+        stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
+    """
+    model_dir = model_config.model_dir
+    model_path = get_model_path(model_dir)
+    model_name = model_config.model_name
+
+    # Extract stress_time and stress_timeout from the tuple
+    stress_time, stress_timeout = stress_time_timeout
+
+    # Configure disaggregated serving parallelism from model config
+    ctx_tp = model_config.tp_size
+    ctx_pp = 1
+    gen_tp = model_config.tp_size
+    gen_pp = 1
+
+    # Calculate GPU requirements
+    # Need GPUs for both context server and generation server
+    required_gpus = (ctx_tp * ctx_pp) + (gen_tp * gen_pp)
+    required_memory = model_config.memory_requirement
+
+    if get_device_count() < required_gpus:
+        pytest.skip(f"Not enough GPUs. Required: {required_gpus} "
+                    f"(ctx: {ctx_tp * ctx_pp} + gen: {gen_tp * gen_pp})")
+
+    if get_device_memory() < required_memory:
+        pytest.skip(f"Not enough GPU memory. Required: {required_memory}GB")
+
+    # Verify model path exists
+    if not os.path.exists(model_path):
+        pytest.skip(f"Model path does not exist: {model_path}")
+
+    # Context server configuration
+    ctx_server_config = {
+        "tensor_parallel_size": ctx_tp,
+        "pipeline_parallel_size": ctx_pp,
+        "disable_overlap_scheduler": True,
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.7,
+        },
+        "cache_transceiver_config": {
+            "backend": "DEFAULT"
+        },
+        "scheduler_config": {
+            "capacity_scheduler_policy": capacity_scheduler_policy
+        },
+        "max_batch_size": 24,
+        "cuda_graph_config": None,
+    }
+
+    # Generation server configuration
+    gen_server_config = {
+        "tensor_parallel_size": gen_tp,
+        "pipeline_parallel_size": gen_pp,
+        "disable_overlap_scheduler": False,
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.7,
+        },
+        "cache_transceiver_config": {
+            "backend": "DEFAULT"
+        },
+        "scheduler_config": {
+            "capacity_scheduler_policy": capacity_scheduler_policy
+        },
+        "max_batch_size": 128,
+        "max_num_tokens": 2048,
+        "cuda_graph_config": None,
+    }
+
+    # Main disaggregated server configuration
+    disaggregated_server_config = {
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "context_servers": {
+            "num_instances": 1,
+            "urls": ["localhost:8001"]
+        },
+        "generation_servers": {
+            "num_instances": 1,
+            "urls": ["localhost:8002"]
+        }
+    }
+
+    # Check if server is already running
+    is_healthy, _ = check_server_health(f"http://localhost:8000", 10.0)
+    if is_healthy:
+        raise RuntimeError(
+            "Server is already running at http://localhost:8000. "
+            "Please stop it manually before running the stress test.")
+
+    print_info("=" * 80)
+    print_info(f"Starting Disaggregated Serving Stress Test for {model_name}")
+    print_info(f"Test Mode: {test_mode}")
+    print_info(f"Capacity Scheduler Policy: {capacity_scheduler_policy}")
+    print_info(f"Context Server: TP={ctx_tp}, PP={ctx_pp}")
+    print_info(f"Generation Server: TP={gen_tp}, PP={gen_pp}")
+    print_info("=" * 80)
+
+    # Launch disaggregated serving
+    with launch_disaggregated_serving(
+            disaggregated_server_config=disaggregated_server_config,
+            ctx_server_config=ctx_server_config,
+            gen_server_config=gen_server_config,
+            model_path=model_path,
+            server_waiting_timeout=3600):
+
+        # Create server config for the main endpoint
+        server_config = ServerConfig(
+            port=8000,
+            host="localhost",
+            capacity_scheduler_policy=capacity_scheduler_policy)
+
+        # Define test configurations
+        performance_config = None
+        run_performance = test_mode in [
+            "stress-test", "stress-test-with-accuracy"
+        ]
+        run_accuracy = test_mode == "stress-test-with-accuracy"
+
+        if run_performance:
+            # Set timeout based on model complexity (large models need more time)
+            test_timeout = 36000  # 10 hours default for large models like DeepSeek-R1-0528-FP4
+            performance_config = PerformanceParams(test_timeout=test_timeout)
+
+        # Create stress test configuration with backend specified
+        stress_model_config = ModelConfig(
+            model_dir=model_config.model_dir,
+            tp_size=model_config.tp_size,
+            memory_requirement=model_config.memory_requirement,
+            backend="pytorch"  # Disaggregated serving uses pytorch backend
+        )
+
+        stress_config = StressTestConfig(model_config=stress_model_config,
+                                         server_config=server_config,
+                                         stress_time=stress_time,
+                                         stress_timeout=stress_timeout,
+                                         enable_accuracy_test=run_accuracy)
+
+        # Run baseline accuracy test first if enabled
+        baseline_accuracy_success = True
+        baseline_accuracy_value = None
+        if run_accuracy:
+            print_info("=" * 80)
+            print_info("=== Running BASELINE ACCURACY TEST (GSM8K) ===")
+            print_info("=" * 80)
+            baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
+                model_path, server_config, stress_config, "baseline")
+
+        # Run performance test if enabled
+        stage2_output = None
+        if run_performance:
+            print_info("=" * 80)
+            print_info("=== Running STAGE 1 PERFORMANCE TEST ===")
+            print_info("=" * 80)
+            measure_capacity_stage(model_name, model_path, server_config,
+                                   performance_config)
+            print_info("=" * 80)
+            print_info("=== Running STAGE 2 ANALYSIS ===")
+            print_info("=" * 80)
+            stage2_output = extract_stress_test_metrics(
+                current_model=model_name)
+            print_info(f"Stage 2 output: {stage2_output}")
+            print_info("=" * 80)
+            print_info("=== Running STAGE 3 STRESS TEST ===")
+            print_info("=" * 80)
+            stress_stage(model_name, model_path, server_config, stress_config,
+                         stage2_output)
+        elif test_mode == "stress-stage-alone":
+            print_info("=" * 80)
+            print_info(
+                "=== Running STAGE 3 STRESS TEST WITH CUSTOMIZED PARAMETERS ==="
+            )
+            print_info("=" * 80)
+            stress_stage(model_name, model_path, server_config, stress_config,
+                         None)
+
+        # Run post-stress accuracy test if enabled
+        post_stress_accuracy_success = True
+        post_stress_accuracy_value = None
+        if run_accuracy:
+            print_info("=" * 80)
+            print_info("=== Running POST-STRESS ACCURACY TEST (GSM8K) ===")
+            print_info("=" * 80)
+            post_stress_accuracy_success, post_stress_accuracy_value = run_accuracy_test(
+                model_path, server_config, stress_config, "post_stress")
+
+            # Report accuracy test results
+            print_info("=" * 80)
+            if baseline_accuracy_success and post_stress_accuracy_success:
+                print_info("=== ACCURACY TEST SUMMARY ===")
+                print_info("✓ Baseline accuracy test: PASSED")
+                print_info("✓ Post-stress accuracy test: PASSED")
+
+                # Compare accuracy values if both are available
+                if baseline_accuracy_value is not None and post_stress_accuracy_value is not None:
+                    accuracy_drop = baseline_accuracy_value - post_stress_accuracy_value
+                    accuracy_drop_percentage = (accuracy_drop /
+                                                baseline_accuracy_value) * 100
+
+                    print_info(
+                        f"Baseline accuracy: {baseline_accuracy_value:.4f}")
+                    print_info(
+                        f"Post-stress accuracy: {post_stress_accuracy_value:.4f}"
+                    )
+                    print_info(
+                        f"Accuracy drop: {accuracy_drop:.4f} ({accuracy_drop_percentage:.2f}%)"
+                    )
+
+                    # Define threshold for significant accuracy drop (e.g., 5%)
+                    accuracy_drop_threshold = 0.05  # 5%
+                    # Assert that accuracy drop is within acceptable threshold
+                    assert accuracy_drop_percentage <= (
+                        accuracy_drop_threshold * 100
+                    ), f"Accuracy drop {accuracy_drop_percentage:.2f}% exceeds threshold {accuracy_drop_threshold * 100}%"
+                    print_info(
+                        "✓ Model accuracy appears stable under stress conditions"
+                    )
+            else:
+                print_warning("=== ACCURACY TEST SUMMARY ===")
+                if not baseline_accuracy_success:
+                    print_warning("✗ Baseline accuracy test: FAILED")
+                if not post_stress_accuracy_success:
+                    print_warning("✗ Post-stress accuracy test: FAILED")
+                print_warning(
+                    "Model accuracy may be affected by stress conditions")
+            print_info("=" * 80)
+
+        print_info("=" * 80)
+        print_info("Disaggregated Serving Stress Test Completed Successfully!")
+        print_info("=" * 80)
 
 
 def stress_test(config,
