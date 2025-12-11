@@ -44,7 +44,8 @@ import pandas as pd
 import pytest
 import requests
 import yaml
-from defs.conftest import get_device_count, get_device_memory, llm_models_root
+from defs.conftest import (get_device_count, get_device_memory, llm_models_root,
+                           skip_post_blackwell)
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
@@ -363,11 +364,14 @@ def check_server_health(server_url: str,
                     tp_size=1,
                     memory_requirement=12),
         # Configuration for DeepSeek-V3 model
-        ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
+        pytest.param(ModelConfig(
+            model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
+                     marks=skip_post_blackwell),
         # Configuration for DeepSeek-R1 model
-        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
-                    tp_size=8,
-                    memory_requirement=96),
+        pytest.param(ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
+                                 tp_size=8,
+                                 memory_requirement=96),
+                     marks=skip_post_blackwell),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -1028,6 +1032,7 @@ def stress_stage(model_name,
         output_len_std=PerformanceParams.output_len_std,
         warmup_request_count=10)
 
+    time.sleep(300)
     # Start genai-perf process
     process_completed = run_genai_perf_process(cmd, test_start_time,
                                                test_timeout, server_config,
