@@ -39,7 +39,9 @@ import requests
 import yaml
 
 from defs.conftest import skip_pre_hopper
-from defs.stress_test import (
+from defs.trt_test_alternative import popen, print_info, print_warning
+
+from .stress_test import (
     ModelConfig,
     PerformanceParams,
     RequestCounter,
@@ -52,7 +54,6 @@ from defs.stress_test import (
     run_accuracy_test,
     stress_stage,
 )
-from defs.trt_test_alternative import popen, print_info, print_warning
 
 
 @contextlib.contextmanager
