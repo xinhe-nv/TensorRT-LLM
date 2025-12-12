@@ -3199,8 +3199,7 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-    pytest.param('Kimi-K2-Instruct',
-                 marks=(skip_pre_hopper, skip_post_blackwell)),
+    pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
     pytest.param('nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
                  marks=skip_pre_hopper),
 ])
@@ -3241,10 +3240,9 @@ def test_multi_nodes_eval(llm_venv, model_path, tp_size, pp_size, ep_size,
         print_warning(f"eval output:\n{e.output}")
         raise
     else:
-        if os.environ.get("SLURM_PROCID", '0') == '0':
-            print_info(f"eval output:\n{output}")
-            mmlu_accuracy = get_mmlu_accuracy(output)
-            assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+        print_info(f"eval output:\n{output}")
+        mmlu_accuracy = get_mmlu_accuracy(output)
+        assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
