@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from typing import Callable
 
 import pytest
@@ -28,11 +29,13 @@ except ImportError:
     import tensorrt_llm.ray_stub as ray
 
 import yaml
-from defs.common import (revise_disagg_config_file_with_free_ports,
+from defs.common import (parse_gsm8k_output,
+                         revise_disagg_config_file_with_free_ports,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper)
-from defs.trt_test_alternative import check_call, check_output, popen
+                           skip_no_hopper, skip_pre_blackwell)
+from defs.trt_test_alternative import (check_call, check_output, popen,
+                                       print_info)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
@@ -177,6 +180,13 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml"
          ),
+        "deepseek_r1_v2_fp4_stress":
+        (8,
+         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml"
+         ),
+        "gpt_oss_120b_stress":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml"),
     }
 
     if test_desc not in config_map:
@@ -1615,11 +1625,40 @@ def run_disaggregated_genai_perf(config_file,
                                  model_path,
                                  num_ranks,
                                  server_start_timeout=1200,
-                                 input_tokens=128000,
+                                 input_tokens=128,
                                  output_tokens=100,
+                                 concurrency=1,
+                                 endpoint_type='chat',
+                                 request_count=None,
+                                 warmup_request_count=10,
+                                 timeout_ms=200000,
+                                 streaming=True,
+                                 random_seed=100,
+                                 accuracy_test=False,
+                                 threshold=0.8,
                                  env=None,
                                  cwd=None):
-    """Run disaggregated test with genai-perf for performance/stress testing."""
+    """Run disaggregated test with genai-perf for performance/stress testing.
+
+    Args:
+        config_file: Path to disaggregated server config YAML
+        model_path: Path to model for tokenizer
+        num_ranks: Number of MPI ranks for workers
+        server_start_timeout: Timeout in seconds for server startup
+        input_tokens: Mean synthetic input tokens
+        output_tokens: Mean output tokens to generate
+        concurrency: Number of concurrent requests
+        endpoint_type: 'chat' or 'completions'
+        request_count: Total requests (if None, uses concurrency*1024 or num_dataset_entries)
+        warmup_request_count: Number of warmup requests
+        timeout_ms: Request timeout in milliseconds for genai-perf
+        streaming: Whether to use streaming mode
+        random_seed: Random seed for reproducibility
+        accuracy_test: Whether to run accuracy test
+        threshold: Threshold for accuracy test
+        env: Environment variables dict
+        cwd: Working directory
+    """
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
@@ -1660,27 +1699,69 @@ def run_disaggregated_genai_perf(config_file,
                     f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
 
-            # Run genai-perf
+            # Build base command
             genai_perf_cmd = [
                 'genai-perf', 'profile', '--model', model_path, '--tokenizer',
-                model_path, '--endpoint-type', 'chat', '--endpoint',
-                '/v1/chat/completions', '--streaming', '--url',
-                f'{server_host}:{server_port}', '--synthetic-input-tokens-mean',
+                model_path, '--endpoint-type', endpoint_type
+            ]
+
+            # Add endpoint path based on type
+            if endpoint_type == 'chat':
+                genai_perf_cmd.extend(['--endpoint', '/v1/chat/completions'])
+
+            # Add streaming flag if enabled
+            if streaming:
+                genai_perf_cmd.append('--streaming')
+
+            # Add common parameters
+            genai_perf_cmd.extend([
+                '--url', f'{server_host}:{server_port}',
+                '--synthetic-input-tokens-mean',
                 str(input_tokens), '--synthetic-input-tokens-stddev', '0',
                 '--output-tokens-mean',
                 str(output_tokens), '--output-tokens-stddev', '0',
                 '--extra-inputs', f'max_tokens:{output_tokens}',
                 '--extra-inputs', f'min_tokens:{output_tokens}',
-                '--extra-inputs', 'ignore_eos:true', '--concurrency', '1',
-                '--warmup-request-count', '8', '--num-dataset-entries', '64',
-                '--random-seed', '100', '--artifact-dir', artifact_dir, '--',
-                '-v', '-H', 'Authorization: Bearer NOT USED', '-H',
-                'Accept: text/event-stream', '-p', '200000'
-            ]
+                '--extra-inputs', 'ignore_eos:true', '--concurrency',
+                str(concurrency), '--warmup-request-count',
+                str(warmup_request_count)
+            ])
 
+            # Use request-count or num-dataset-entries
+            if request_count is not None:
+                genai_perf_cmd.extend(['--request-count', str(request_count)])
+            else:
+                # Default: use num-dataset-entries for compatibility
+                genai_perf_cmd.extend(['--num-dataset-entries', '64'])
+
+            genai_perf_cmd.extend([
+                '--random-seed',
+                str(random_seed), '--artifact-dir', artifact_dir, '--', '-v',
+                '-H', 'Authorization: Bearer NOT USED', '-H',
+                'Accept: text/event-stream', '-p',
+                str(timeout_ms)
+            ])
+
+            # Run genai-perf
             check_call(genai_perf_cmd,
                        env=env,
                        poll_procs=[workers_proc, server_proc])
+
+            if accuracy_test:
+                accuracy_test_result, accuracy_value = run_accuracy_test(
+                    model_path=model_path,
+                    server_url=f"http://{server_host}:{server_port}",
+                    concurrency=concurrency,
+                    max_retries=3,
+                    timeout=1200,
+                    max_gen_toks=256,
+                    max_length=4096)
+
+                # only raise error if accuracy test passed and accuracy value is less than threshold
+                if accuracy_test_result and (accuracy_value < threshold):
+                    raise AssertionError(
+                        f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
+                    )
 
     except Exception:
         # Print outputs on error
@@ -1709,6 +1790,82 @@ def run_disaggregated_genai_perf(config_file,
         workers_proc.terminate()
         server_proc.wait()
         workers_proc.wait()
+
+
+def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
+                      max_retries: int, timeout: int, max_gen_toks: int,
+                      max_length: int) -> tuple[bool, float]:
+    """
+    Run accuracy test using lm_eval with GSM8K dataset
+
+    Args:
+        model_path: Path of the model being tested
+        server_config: Server configuration containing URL and port
+        concurrency: Concurrency for accuracy tests
+        max_retries: Max retries for accuracy tests
+        timeout: Timeout for accuracy tests
+        max_gen_toks: Max generation tokens for accuracy tests
+        max_length: Max length for accuracy tests
+
+    Returns:
+        tuple: (Boolean indicating whether the accuracy test completed successfully, accuracy value)
+    """
+    logger.info(f"=== Running ACCURACY TEST (GSM8K) ===")
+
+    # Create lm_eval command
+    lm_eval_cmd = [
+        "lm_eval", "--model", "local-completions", "--tasks", "gsm8k",
+        "--model_args",
+        f"model={model_path},base_url={server_url}/v1/completions,"
+        f"num_concurrent={concurrency},"
+        f"max_retries={max_retries},"
+        f"tokenized_requests=False,"
+        f"timeout={timeout},"
+        f"max_gen_toks={max_gen_toks},"
+        f"max_length={max_length}", "--trust_remote_code"
+    ]
+
+    test_start_time = time.time()
+    accuracy_value = 0.0
+
+    try:
+        # Run lm_eval process with timeout monitoring
+        print_info(f"Running lm_eval command: {' '.join(lm_eval_cmd)}")
+
+        # Use subprocess.run to capture output directly
+        result = subprocess.run(lm_eval_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=timeout)
+
+        print_info(f"Accuracy test result is: {result}")
+
+        # Check if process completed successfully
+        if result.returncode == 0:
+            test_end_time = time.time()
+            duration = int(test_end_time - test_start_time)
+            logger.info(
+                f"Accuracy test completed successfully in {duration} seconds")
+
+            # Parse accuracy value from output
+            output_text = result.stdout
+            accuracy_value = parse_gsm8k_output(output_text)
+            if accuracy_value is not None:
+                return True, accuracy_value
+            else:
+                return False, accuracy_value
+        else:
+            logger.warning(
+                f"lm_eval exited with non-zero code: {result.returncode}")
+            logger.warning(f"stderr: {result.stderr}")
+            return False, accuracy_value
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Accuracy test timed out after {timeout} seconds")
+        return False, accuracy_value
+    except Exception as e:
+        logger.warning(f"Error during accuracy test: {str(e)}")
+        return False, accuracy_value
 
 
 @pytest.mark.parametrize("benchmark_model_root", [
@@ -1854,3 +2011,52 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory(),
                            prompt_file="long_prompts.json")
+
+
+@pytest.mark.parametrize("test_config", [
+    pytest.param(
+        ('DeepSeek-R1/DeepSeek-R1-0528-FP4-v2', 'deepseek_r1_v2_fp4_stress'),
+        marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+    pytest.param(('gpt_oss/gpt-oss-120b', 'gpt_oss_120b_stress'),
+                 marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+],
+                         ids=lambda x: x[1])
+@pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
+@pytest.mark.parametrize("output_tokens", [1024],
+                         ids=lambda x: f"output{x//1000}k")
+@pytest.mark.parametrize("input_tokens", [8192],
+                         ids=lambda x: f"input{x//1000}k")
+def test_disaggregated_stress_test(disaggregated_test_root,
+                                   disaggregated_example_root, llm_venv,
+                                   test_config, input_tokens, output_tokens,
+                                   concurrency):
+    model_path, test_desc = test_config
+    model_dir = f"{llm_models_root()}/{model_path}"
+    src_dst_dict = {
+        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    num_ranks, config_file = get_test_config(test_desc,
+                                             disaggregated_example_root,
+                                             os.path.dirname(__file__))
+
+    run_disaggregated_genai_perf(config_file=config_file,
+                                 model_path=model_dir,
+                                 num_ranks=num_ranks,
+                                 server_start_timeout=7200,
+                                 input_tokens=input_tokens,
+                                 output_tokens=output_tokens,
+                                 concurrency=concurrency,
+                                 endpoint_type='completions',
+                                 request_count=2000,
+                                 warmup_request_count=10,
+                                 timeout_ms=600000,
+                                 streaming=False,
+                                 accuracy_test=True,
+                                 threshold=0.42,
+                                 env=llm_venv._new_env,
+                                 cwd=llm_venv.get_working_directory())
