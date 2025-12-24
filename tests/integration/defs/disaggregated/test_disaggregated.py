@@ -1621,23 +1621,23 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
-def run_disaggregated_genai_perf(config_file,
-                                 model_path,
-                                 num_ranks,
-                                 server_start_timeout=1200,
-                                 input_tokens=128,
-                                 output_tokens=100,
-                                 concurrency=1,
-                                 endpoint_type='chat',
-                                 request_count=None,
-                                 warmup_request_count=10,
-                                 timeout_ms=200000,
-                                 streaming=True,
-                                 random_seed=100,
-                                 accuracy_test=False,
-                                 threshold=0.8,
-                                 env=None,
-                                 cwd=None):
+def run_disaggregated_aiperf(config_file,
+                             model_path,
+                             num_ranks,
+                             server_start_timeout=1200,
+                             input_tokens=128,
+                             output_tokens=100,
+                             concurrency=1,
+                             endpoint_type='chat',
+                             request_count=None,
+                             warmup_request_count=10,
+                             timeout_ms=200000,
+                             streaming=True,
+                             random_seed=100,
+                             accuracy_test=False,
+                             threshold=0.8,
+                             env=None,
+                             cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -1699,22 +1699,22 @@ def run_disaggregated_genai_perf(config_file,
                     f"Disaggregated server did not become ready within {server_start_timeout} seconds"
                 )
 
-            # Build base command
-            genai_perf_cmd = [
-                'genai-perf', 'profile', '--model', model_path, '--tokenizer',
+            # Build base command (using aiperf instead of genai-perf)
+            aiperf_cmd = [
+                'aiperf', 'profile', '--model', model_path, '--tokenizer',
                 model_path, '--endpoint-type', endpoint_type
             ]
 
             # Add endpoint path based on type
             if endpoint_type == 'chat':
-                genai_perf_cmd.extend(['--endpoint', '/v1/chat/completions'])
+                aiperf_cmd.extend(['--endpoint', '/v1/chat/completions'])
 
             # Add streaming flag if enabled
             if streaming:
-                genai_perf_cmd.append('--streaming')
+                aiperf_cmd.append('--streaming')
 
             # Add common parameters
-            genai_perf_cmd.extend([
+            aiperf_cmd.extend([
                 '--url', f'{server_host}:{server_port}',
                 '--synthetic-input-tokens-mean',
                 str(input_tokens), '--synthetic-input-tokens-stddev', '0',
@@ -1729,21 +1729,18 @@ def run_disaggregated_genai_perf(config_file,
 
             # Use request-count or num-dataset-entries
             if request_count is not None:
-                genai_perf_cmd.extend(['--request-count', str(request_count)])
+                aiperf_cmd.extend(['--request-count', str(request_count)])
             else:
                 # Default: use num-dataset-entries for compatibility
-                genai_perf_cmd.extend(['--num-dataset-entries', '64'])
+                aiperf_cmd.extend(['--num-dataset-entries', '64'])
 
-            genai_perf_cmd.extend([
+            aiperf_cmd.extend([
                 '--random-seed',
-                str(random_seed), '--artifact-dir', artifact_dir, '--', '-v',
-                '-H', 'Authorization: Bearer NOT USED', '-H',
-                'Accept: text/event-stream', '-p',
-                str(timeout_ms)
+                str(random_seed), '--artifact-dir', artifact_dir
             ])
 
-            # Run genai-perf
-            check_call(genai_perf_cmd,
+            # Run aiperf
+            check_call(aiperf_cmd,
                        env=env,
                        poll_procs=[workers_proc, server_proc])
 
@@ -1981,14 +1978,14 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                              disaggregated_example_root,
                                              os.path.dirname(__file__))
 
-    run_disaggregated_genai_perf(config_file=config_file,
-                                 model_path=llama4_model_root,
-                                 num_ranks=num_ranks,
-                                 server_start_timeout=1200,
-                                 input_tokens=128000,
-                                 output_tokens=100,
-                                 env=llm_venv._new_env,
-                                 cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=llama4_model_root,
+                             num_ranks=num_ranks,
+                             server_start_timeout=1200,
+                             input_tokens=128000,
+                             output_tokens=100,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(4)
@@ -2044,19 +2041,19 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                                              disaggregated_example_root,
                                              os.path.dirname(__file__))
 
-    run_disaggregated_genai_perf(config_file=config_file,
-                                 model_path=model_dir,
-                                 num_ranks=num_ranks,
-                                 server_start_timeout=7200,
-                                 input_tokens=input_tokens,
-                                 output_tokens=output_tokens,
-                                 concurrency=concurrency,
-                                 endpoint_type='completions',
-                                 request_count=2000,
-                                 warmup_request_count=10,
-                                 timeout_ms=600000,
-                                 streaming=False,
-                                 accuracy_test=True,
-                                 threshold=0.42,
-                                 env=llm_venv._new_env,
-                                 cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=model_dir,
+                             num_ranks=num_ranks,
+                             server_start_timeout=7200,
+                             input_tokens=input_tokens,
+                             output_tokens=output_tokens,
+                             concurrency=concurrency,
+                             endpoint_type='completions',
+                             request_count=2000,
+                             warmup_request_count=10,
+                             timeout_ms=600000,
+                             streaming=False,
+                             accuracy_test=True,
+                             threshold=0.42,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
