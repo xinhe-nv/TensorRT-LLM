@@ -1809,9 +1809,32 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
     """
     logger.info(f"=== Running ACCURACY TEST (GSM8K) ===")
 
+    tmp_dir = tempfile.TemporaryDirectory()
+    tmp_gsm8k_local_config = os.path.join(tmp_dir.name, "gsm8k_local.yaml")
+
+    gsm8k_local_config_path = os.path.join(
+        os.path.dirname(__file__), '../../lm_eval_configs/gsm8k_local.yaml')
+
+    with open(gsm8k_local_config_path, 'r', encoding='utf-8') as f:
+        config_content = f.read()
+
+    # Replace LLM_MODELS_ROOT with actual path
+    config_content = config_content.replace('LLM_MODELS_ROOT',
+                                            llm_models_root())
+
+    # Write modified config to temp file
+    with open(tmp_gsm8k_local_config, 'w', encoding='utf-8') as f:
+        f.write(config_content)
+
     # Create lm_eval command
     lm_eval_cmd = [
-        "lm_eval", "--model", "local-completions", "--tasks", "gsm8k",
+        "lm_eval",
+        "--model",
+        "local-completions",
+        "--tasks",
+        "gsm8k_local",
+        "--include_path",
+        tmp_dir.name,
         "--model_args",
         f"model={model_path},base_url={server_url}/v1/completions,"
         f"num_concurrent={concurrency},"
@@ -1819,7 +1842,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         f"tokenized_requests=False,"
         f"timeout={timeout},"
         f"max_gen_toks={max_gen_toks},"
-        f"max_length={max_length}", "--trust_remote_code"
+        f"max_length={max_length}",
     ]
 
     test_start_time = time.time()
@@ -2049,7 +2072,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              output_tokens=output_tokens,
                              concurrency=concurrency,
                              endpoint_type='completions',
-                             request_count=2000,
+                             request_count=50000,
                              warmup_request_count=10,
                              timeout_ms=600000,
                              streaming=False,
