@@ -23,6 +23,11 @@ Eligibility is automatic:
                               Manager assumes one Engine per process
 - use-count cap            -> pool retired after N handouts (default 16),
                               bounding worker state accumulation
+- idle timeout             -> a cached pool with no same-size reuse within
+                              N seconds (default 60) is retired in the
+                              background, bounding how long its GPUs stay
+                              claimed for a shape that never comes back in
+                              this shard (e.g. sharded/split test groups)
 
 Between eligible handouts every worker runs a health probe and defensive
 torch.compile/Dynamo reset (exactly once per worker, barrier-pinned:
@@ -228,6 +233,7 @@ class SessionReuseCache:
     def __init__(self):
         self._lock = threading.Lock()
         self._pools = {}  # n_workers -> MpiPoolSession
+        self._idle_timers = {}  # n_workers -> threading.Timer
         self._patched = set()
         self._suspended = False
 
@@ -256,6 +262,18 @@ class SessionReuseCache:
     @property
     def max_uses(self) -> int:
         return int(os.environ.get("TRTLLM_TEST_REUSE_MAX_USES", "16"))
+
+    @property
+    def idle_retire_seconds(self) -> float:
+        """Seconds a cached pool may sit unused before it is retired.
+
+        Bounds how long a pool's GPUs stay claimed for a shape that no
+        later test in this shard happens to match (drain otherwise only
+        runs at a failure fence, an RPC/opt-out seam, or session finish,
+        none of which fire on a shape that simply never recurs). ``0``
+        disables idle retirement.
+        """
+        return float(os.environ.get("TRTLLM_TEST_REUSE_IDLE_SECONDS", "60"))
 
     @staticmethod
     def _retire(real: _PoolSession, broken: bool = False) -> None:
@@ -354,6 +372,9 @@ class SessionReuseCache:
             return real_cls(n_workers=n_workers, wait_shutdown=True)
         with self._lock:
             real = self._pools.pop(n_workers, None)
+            timer = self._idle_timers.pop(n_workers, None)
+        if timer is not None:
+            timer.cancel()
         if real is not None:
             # Compare against the state FROZEN INTO the workers at spawn time:
             # if the current test expects different env/sys.path, the cached
@@ -449,17 +470,55 @@ class SessionReuseCache:
 
     def _release(self, real):
         real._reuse_uses += 1
+        n_workers = real.n_workers
         with self._lock:
-            prior = self._pools.get(real.n_workers)
+            prior = self._pools.get(n_workers)
             if prior is not None and prior is not real:
                 self._retire(real)  # a pool of this size is already cached
                 return
-            self._pools[real.n_workers] = real
+            self._pools[n_workers] = real
+            old_timer = self._idle_timers.get(n_workers)
+            timeout = self.idle_retire_seconds
+            timer = None
+            if timeout > 0:
+                timer = threading.Timer(timeout, self._retire_if_idle, args=(n_workers, real))
+                timer.daemon = True
+                self._idle_timers[n_workers] = timer
+            else:
+                self._idle_timers.pop(n_workers, None)
+        if old_timer is not None:
+            old_timer.cancel()
+        if timer is not None:
+            timer.start()
+
+    def _retire_if_idle(self, n_workers, real):
+        """Timer callback: retire ``real`` if it is still the cached pool.
+
+        A no-op if it was already handed out again, replaced, or drained
+        (identity check under the lock) — the timer racing any of those is
+        harmless.
+        """
+        with self._lock:
+            if self._pools.get(n_workers) is not real:
+                return
+            del self._pools[n_workers]
+            self._idle_timers.pop(n_workers, None)
+        print(
+            f"[session-reuse] retiring {n_workers}-worker pool: idle "
+            f"{self.idle_retire_seconds:g}s with no matching reuse",
+            flush=True,
+        )
+        self._retire(real)
 
     def _forget(self, real):
         with self._lock:
             if self._pools.get(real.n_workers) is real:
                 del self._pools[real.n_workers]
+                timer = self._idle_timers.pop(real.n_workers, None)
+            else:
+                timer = None
+        if timer is not None:
+            timer.cancel()
 
     def suspend(self, suspended: bool) -> None:
         """Bypass the cache for the current test (private_mpi_session)."""
@@ -476,6 +535,9 @@ class SessionReuseCache:
         _reap_retires()
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
+            timers, self._idle_timers = list(self._idle_timers.values()), {}
+        for t in timers:
+            t.cancel()
         if not pools:
             return
 
