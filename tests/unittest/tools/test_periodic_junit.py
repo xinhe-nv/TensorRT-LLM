@@ -25,6 +25,8 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 
 import faulthandler
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -162,6 +164,35 @@ def test_hang_dumps_traceback(make_reporter: ReporterFactory) -> None:
     assert _wait_until(lambda: "hang watchdog fired for pkg/test_x.py::test_y" in _read(path))
     content = _read(path)
     assert "Thread" in content or 'File "' in content
+
+
+def test_hang_dump_lists_child_processes(make_reporter: ReporterFactory) -> None:
+    reporter = make_reporter(hang_dump_fraction=0.1)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
+        path = reporter._hang_traceback_path()
+        assert _wait_until(lambda: f"pid={child.pid} " in _read(path))
+        assert "child process(es)" in _read(path)
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_hang_dump_includes_captured_output(make_reporter: ReporterFactory, capfd) -> None:
+    # Real pytest capture (capfd) stands in for the global capture manager: the dump
+    # must contain output emitted so far, and reading it must not consume it.
+    reporter = make_reporter()
+    os.write(1, b"worker log line before hang\n")
+
+    class _CapMan:
+        _global_capturing = type("MC", (), {"out": capfd._capture.out, "err": capfd._capture.err})()
+
+    reporter.config = type(
+        "Cfg", (), {"pluginmanager": type("PM", (), {"getplugin": lambda self, n: _CapMan()})()}
+    )()
+    assert "worker log line before hang" in reporter._read_captured_output()
+    assert "worker log line before hang" in capfd.readouterr().out
 
 
 def test_subsecond_timeout_arms_before_the_kill(make_reporter: ReporterFactory) -> None:

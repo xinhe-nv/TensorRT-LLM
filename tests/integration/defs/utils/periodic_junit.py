@@ -22,7 +22,10 @@ pytest's built-in junitxml plugin for simplified test result handling.
 import faulthandler
 import os
 import platform
+import shutil
 import signal
+import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -70,6 +73,9 @@ class PeriodicJUnitXML:
             # Registration replays the historic pytest_configure hook.
             config.pluginmanager.register(reporter, 'periodic_junit')
     """
+
+    # Per-stream cap on the captured test output dumped when the hang watchdog fires.
+    _HANG_LOG_TAIL_BYTES = 256 * 1024
 
     def __init__(
             self,
@@ -445,15 +451,135 @@ class PeriodicJUnitXML:
         except (TypeError, ValueError):
             return None
 
+    def _describe_child_processes(self) -> str:
+        """Describe the pytest process tree and, when possible, child Python stacks.
+
+        The pytest process of an LLM test is usually only the client: the real hang
+        is often inside a spawned worker (MPI rank / executor worker), whose stack
+        ``faulthandler`` in this process cannot see. List every descendant, and dump
+        each one's Python stacks with ``py-spy`` when it is installed and allowed to
+        attach (needs ptrace permission, e.g. ``--cap-add=SYS_PTRACE``).
+        """
+        try:
+            import psutil
+        except ImportError:
+            return "(psutil unavailable: child processes not inspected)\n"
+        lines = []
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.Error as e:
+            return f"(could not list child processes: {e})\n"
+        lines.append(f"--- {len(children)} child process(es) of pid "
+                     f"{os.getpid()} ---\n")
+        py_spy = shutil.which("py-spy")
+        if children and py_spy is None:
+            lines.append("(py-spy not found on PATH: child Python stacks are "
+                         "not dumped; `pip install py-spy` to enable)\n")
+        for child in children:
+            try:
+                cmdline = " ".join(child.cmdline())[:300]
+                lines.append(f"pid={child.pid} ppid={child.ppid()} "
+                             f"status={child.status()} "
+                             f"cpu={child.cpu_percent(interval=None):.0f}% "
+                             f"rss={child.memory_info().rss >> 20}MiB "
+                             f"cmd={cmdline}\n")
+            except psutil.Error:
+                lines.append(f"pid={child.pid} (exited or inaccessible)\n")
+                continue
+            if py_spy is None or "python" not in cmdline.lower():
+                continue
+            try:
+                result = subprocess.run(
+                    [py_spy, "dump", "--pid",
+                     str(child.pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False)
+                lines.append(result.stdout or result.stderr)
+            except (OSError, subprocess.SubprocessError) as e:
+                lines.append(f"(py-spy failed for pid {child.pid}: {e})\n")
+        return "".join(lines)
+
+    def _read_captured_output(self) -> str:
+        """Return the tail of the output pytest has captured so far for this test.
+
+        Without ``-s`` pytest redirects stdout/stderr (including those of spawned
+        workers, which inherit the fds) into temp files that are only shown after the
+        test ends -- never for a hang. They are read with ``os.pread`` so the file
+        offset and contents are left untouched and the junit ``out-err`` is still
+        complete. Only the last ``_HANG_LOG_TAIL_BYTES`` of each stream are kept.
+        """
+        capman = None
+        config = getattr(self, "config", None)
+        if config is not None:
+            capman = config.pluginmanager.getplugin("capturemanager")
+        multicapture = getattr(capman, "_global_capturing", None)
+        parts = []
+        for name in ("out", "err"):
+            capture = getattr(multicapture, name, None)
+            tmpfile = getattr(capture, "tmpfile", None)
+            if tmpfile is None:
+                continue
+            try:
+                try:
+                    fd = tmpfile.fileno()  # fd capture
+                except (AttributeError, OSError, ValueError):
+                    data = tmpfile.getvalue().encode("utf-8",
+                                                     "replace")  # sys capture
+                else:
+                    size = os.fstat(fd).st_size
+                    start = max(0, size - self._HANG_LOG_TAIL_BYTES)
+                    data = os.pread(fd, size - start, start)
+            except (AttributeError, OSError, ValueError):
+                continue
+            text = data[-self._HANG_LOG_TAIL_BYTES:].decode("utf-8", "replace")
+            parts.append(f"--- captured std{name} so far (last "
+                         f"{len(data)} bytes) ---\n{text}\n")
+        return "".join(parts) or "(no captured output available)\n"
+
+    def _echo_to_console(self, text: str) -> None:
+        """Print ``text`` to the real console even while pytest captures output.
+
+        Without ``-s`` pytest redirects fd 1/2 to temp files, so the watchdog dump
+        would otherwise only exist in the sidecar file. Capture is suspended just
+        for the write and resumed afterwards, so the test's captured output (and
+        the junit ``out-err``) is unaffected.
+        """
+        capman = None
+        config = getattr(self, "config", None)
+        if config is not None:
+            capman = config.pluginmanager.getplugin("capturemanager")
+        try:
+            if capman is not None:
+                with capman.global_and_fixture_disabled():
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+            else:
+                sys.stderr.write(text)
+                sys.stderr.flush()
+        except (OSError, RuntimeError, ValueError):
+            pass
+
     def _dump_hang(self, nodeid: str) -> None:
-        """Write every thread's stack to the sidecar file (called from the timer)."""
+        """Write every thread's stack to the sidecar file and the console.
+
+        Called from the timer thread. Besides this process's own threads, also
+        records the child process tree (and child Python stacks via py-spy).
+        """
         if self._hang_file is None:
             return
         try:
+            start = self._hang_file.tell()
             self._hang_file.write(
                 f"\n===== hang watchdog fired for {nodeid} =====\n")
             faulthandler.dump_traceback(file=self._hang_file, all_threads=True)
+            self._hang_file.write(self._describe_child_processes())
+            self._hang_file.write(self._read_captured_output())
             self._hang_file.flush()
+            with open(self._hang_traceback_path(), encoding="utf-8") as f:
+                f.seek(start)
+                self._echo_to_console(f.read())
         except (OSError, RuntimeError, ValueError):
             pass
 
