@@ -26,7 +26,7 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
+from defs.conftest import get_sm_version, llm_models_root, skip_pre_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                get_registered_worker_urls,
                                resolve_server_start_timeout, run_ctx_worker,
@@ -783,7 +783,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
@@ -1020,7 +1020,7 @@ class ConversationRouterTester(BasicWorkerTester):
             await self.ctx_router.close()
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(3)
 def test_workers_conversation_router(disaggregated_test_root,
                                      disaggregated_example_root, llm_venv):

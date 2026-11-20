@@ -2052,7 +2052,7 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
@@ -2068,7 +2068,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
@@ -2085,7 +2085,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
 
 @pytest.mark.skip_less_device(4)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
@@ -2103,7 +2103,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
 
 
 @pytest.mark.skip_less_device(8)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse(
@@ -2121,7 +2121,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
 
 @pytest.mark.skip_less_device(8)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_long_prompt(
@@ -2217,7 +2217,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2287,7 +2287,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
             "prompt tail trimming: first trimmed request sends 256"))
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2305,7 +2305,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
         cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2322,7 +2322,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2339,7 +2339,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2356,7 +2356,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2376,7 +2376,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
 
 
 @pytest.mark.skip_less_device(4)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
@@ -2393,7 +2393,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
 
 
 @pytest.mark.skip_less_device(2)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_conditional(
@@ -2440,7 +2440,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
                            perf_metrics_output_dir=perf_metrics_output_dir)
 
 
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
