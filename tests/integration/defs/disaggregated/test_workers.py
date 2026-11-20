@@ -529,6 +529,12 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             first_match = info["matches"][0]
             logger.info(f"Matched blocks: {first_match}")
             assert first_match > 0
+            dummy_hashes = set(info["block_hashes"][0])
+            print(
+                f"Eviction probe: pool={block_pool_size}, "
+                f"algo={server_state.hash_algo}, match={first_match}, "
+                f"dummy_blocks={len(dummy_hashes)}",
+                flush=True)
             await self.gen_router.finish_request(openai_request)
 
             # flood requests until eviction
@@ -549,6 +555,18 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                 ])
                 events = await self.query_kv_cache_events(session, server)
                 server_state.update_with_events(events)
+                removed_hashes = {
+                    h
+                    for event in events if event["type"] == "removed"
+                    for h in event["block_hashes"]
+                }
+                print(
+                    f"Eviction probe: batch={i}, events={len(events)}, "
+                    f"removed={len(removed_hashes)}, "
+                    f"dummy_removed={len(removed_hashes & dummy_hashes)}, "
+                    f"algo={server_state.hash_algo}, "
+                    f"remaining={len(server_state._block_table(server_state.hash_algo) & dummy_hashes)}",
+                    flush=True)
                 for event in events:
                     if event["type"] == "removed":
                         has_evicted = True
